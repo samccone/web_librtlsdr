@@ -1,0 +1,10 @@
+A web port of https://github.com/steve-m/librtlsdr
+
+dev:
+
+    yarn install
+    yarn dev
+
+    # start a local server and visit localhost:$PORT
+
+
