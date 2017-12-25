@@ -9,7 +9,7 @@ import {
   rtlsdr_demod_write_reg,
   rtlsdr_set_fir
 } from "read_write";
-import { findTuner } from "./tuner_locator";
+import { findTuner, setupRadioTuner } from "./tuner_locator";
 
 function sleep(time: number) {
   return new Promise(res => {
@@ -54,7 +54,13 @@ async function handleDevice(device: USBDevice) {
     // Turn radio on
     await rtlsdr_set_i2c_repeater(radio, true);
 
-    findTuner(radio);
+    const tunerType = await findTuner(radio);
+    if (tunerType === undefined) {
+      throw new Error("Unknown tuner type.");
+    }
+    radio.tuner = tunerType;
+
+    await setupRadioTuner(radio);
 
     // Turn radio off
     await rtlsdr_set_i2c_repeater(radio, false);

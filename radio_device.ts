@@ -13,6 +13,8 @@
  *
  */
 
+const DEF_RTL_XTAL_FREQ = 28800000;
+
 const fir_default = [
   -54,
   -36,
@@ -32,11 +34,21 @@ const fir_default = [
   421 /* 12 bit signed */
 ];
 
+export enum TUNERS {
+  RTLSDR_TUNER_R820T
+}
+
 export class RadioDevice {
   fir: number[];
+  tuner: TUNERS;
+  rtl_xtal: number;
+  tun_xtal: number;
+  corr: number;
 
   constructor(public usb: USBDevice) {
     this.fir = Array.from(fir_default);
+    this.tun_xtal = this.rtl_xtal = DEF_RTL_XTAL_FREQ;
+    this.corr = 0;
   }
 
   async claimIntefaces() {

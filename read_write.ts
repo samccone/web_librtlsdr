@@ -287,3 +287,42 @@ export async function rtlsdr_set_i2c_repeater(
 ) {
   return rtlsdr_demod_write_reg(device, 1, 0x01, on ? 0x18 : 0x10, 1);
 }
+
+export async function rtlsdr_set_if_freq(dev: RadioDevice, freq: number) {
+  let if_freq: number;
+  let tmp: number;
+  let r: number;
+
+  /* read corrected clock value */
+  const { rtl_freq } = await rtlsdr_get_xtal_freq(dev, 0, null);
+  if_freq = freq * Math.pow(2, 22) / rtl_freq! * -1;
+
+  tmp = (if_freq >> 16) & 0x3f;
+  r = await rtlsdr_demod_write_reg(dev, 1, 0x19, tmp, 1);
+  tmp = (if_freq >> 8) & 0xff;
+  r |= await rtlsdr_demod_write_reg(dev, 1, 0x1a, tmp, 1);
+  tmp = if_freq & 0xff;
+  r |= await rtlsdr_demod_write_reg(dev, 1, 0x1b, tmp, 1);
+
+  return r;
+}
+
+function rtlsdr_get_xtal_freq(
+  dev: RadioDevice,
+  rtl_freq: number | null,
+  tuner_freq: number | null
+) {
+  function APPLY_PPM_CORR(val: number, ppm: number) {
+    return val * (1.0 + ppm / 1e6);
+  }
+
+  if (rtl_freq != null) {
+    rtl_freq = APPLY_PPM_CORR(dev.rtl_xtal, dev.corr);
+  }
+
+  if (tuner_freq != null) {
+    tuner_freq = APPLY_PPM_CORR(dev.tun_xtal, dev.corr);
+  }
+
+  return { rtl_freq, tuner_freq };
+}
