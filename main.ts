@@ -38,6 +38,40 @@ enum SYS_REG {
   IR_SUSPEND = 0x300c
 }
 
+const FIR_LEN = 16;
+
+/*
+ * FIR coefficients.
+ *
+ * The filter is running at XTal frequency. It is symmetric filter with 32
+ * coefficients. Only first 16 coefficients are specified, the other 16
+ * use the same values but in reversed order. The first coefficient in
+ * the array is the outer one, the last, the last is the inner one.
+ * First 8 coefficients are 8 bit signed integers, the next 8 coefficients
+ * are 12 bit signed integers. All coefficients have the same weight.
+ *
+ * Default FIR coefficients used for DAB/FM by the Windows driver,
+ * the DVB driver uses different ones
+ */
+const fir_default = [
+  -54,
+  -36,
+  -41,
+  -40,
+  -32,
+  -14,
+  14,
+  53 /* 8 bit signed */,
+  101,
+  156,
+  215,
+  273,
+  327,
+  372,
+  404,
+  421 /* 12 bit signed */
+];
+
 enum USBRequestType {
   STANDARD = "standard",
   CLASS = "class",
@@ -49,6 +83,20 @@ enum USBRecipient {
   INTERFACE = "interface",
   ENDPOINT = "endpoint",
   OTHER = "other"
+}
+
+function sleep(time: number) {
+  return new Promise(res => {
+    setTimeout(res, time);
+  });
+}
+
+class RadioDevice {
+  fir: number[];
+
+  constructor(public usb: USBDevice) {
+    this.fir = Array.from(fir_default);
+  }
 }
 
 export async function run() {
@@ -80,9 +128,22 @@ async function handleDevice(device: USBDevice) {
 
     await device.claimInterface(openInterface);
     console.info(`Interface ${openInterface} claimed`);
+    const radio = new RadioDevice(device);
 
     /* perform a dummy write, if it fails, reset the device */
-    await rtlsdr_write_reg(device, BLOCKS.USBB, USB_REG.USB_SYSCTL, 0x09, 1);
+    try {
+      await rtlsdr_write_reg(radio, BLOCKS.USBB, USB_REG.USB_SYSCTL, 0x09, 1);
+    } catch (e) {
+      throw new Error("Device in invalid state.. please reconnect.");
+    }
+
+    // setup radio device.
+    await rtlsdr_init_baseband(radio);
+
+    // Turn radio on
+    // await rtlsdr_set_i2c_repeater(radio, true);
+    // Turn radio off
+    // await rtlsdr_set_i2c_repeater(radio, false);
   } else {
     throw new Error("Unknown device found.");
   }
@@ -101,7 +162,7 @@ async function getOpenInterfaceNumber(device: USBDevice) {
 }
 
 async function rtlsdr_write_reg(
-  device: USBDevice,
+  device: RadioDevice,
   block: number,
   addr: number,
   val: number,
@@ -119,8 +180,9 @@ async function rtlsdr_write_reg(
 
   data[1] = val & 0xff;
 
+  // #define CTRL_OUT	(LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_OUT)
   // r = libusb_control_transfer(dev->devh, CTRL_OUT, 0, addr, index, data, len, CTRL_TIMEOUT);
-  const r = await device.controlTransferOut(
+  const r = await device.usb.controlTransferOut(
     {
       requestType: USBRequestType.VENDOR,
       recipient: USBRecipient.DEVICE,
@@ -132,58 +194,175 @@ async function rtlsdr_write_reg(
   );
 
   if (r.status !== "ok") {
-    throw new Error(`Failed with response code ${r}`);
+    console.log(r);
+    throw new Error(`Failed with response code ${r.status}`);
   }
+
+  return r;
 }
 
-// function rtlsdr_init_baseband(dev: USBDevice) {
-//   /* initialize USB */
-//   rtlsdr_write_reg(dev, BLOCKS.USBB, USB_REG.USB_SYSCTL, 0x09, 1);
-//   rtlsdr_write_reg(dev, BLOCKS.USBB, USB_REG.USB_EPA_MAXPKT, 0x0002, 2);
-//   rtlsdr_write_reg(dev, BLOCKS.USBB, USB_REG.USB_EPA_CTL, 0x1002, 2);
+async function rtlsdr_demod_read_reg(
+  device: RadioDevice,
+  page: number,
+  addr: number,
+  val: number
+) {
+  const data = new Uint8Array(2);
+  const index = page;
+  let reg: number;
+  addr = (addr << 8) | 0x20;
 
-//   /* poweron demod */
-//   rtlsdr_write_reg(dev, BLOCKS.SYSB, SYS_REG.DEMOD_CTL_1, 0x22, 1);
-//   rtlsdr_write_reg(dev, BLOCKS.SYSB, SYS_REG.DEMOD_CTL, 0xe8, 1);
+  // CTRL_IN         (LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_IN)
+  //r = libusb_control_transfer(dev->devh, CTRL_IN, 0, addr, index, data, len, CTRL_TIMEOUT);
+  const r = await device.usb.controlTransferIn(
+    {
+      requestType: USBRequestType.VENDOR,
+      recipient: USBRecipient.DEVICE,
+      index,
+      request: addr,
+      value: val
+    },
+    data.length
+  );
 
-//   /* reset demod (bit 3, soft_rst) */
-//   rtlsdr_demod_write_reg(dev, 1, 0x01, 0x14, 1);
-//   rtlsdr_demod_write_reg(dev, 1, 0x01, 0x10, 1);
+  if (r.status !== "ok") {
+    console.log(r);
+    throw new Error(`Failed with response ${r}`);
+  }
 
-//   /* disable spectrum inversion and adjacent channel rejection */
-//   rtlsdr_demod_write_reg(dev, 1, 0x15, 0x00, 1);
-//   rtlsdr_demod_write_reg(dev, 1, 0x16, 0x0000, 2);
+  reg = (data[1] << 8) | data[0];
 
-//   /* clear both DDC shift and IF frequency registers  */
-//   for (let i = 0; i < 6; i++) {
-//     rtlsdr_demod_write_reg(dev, 1, 0x16 + i, 0x00, 1);
-//   }
+  return reg;
+}
 
-//   rtlsdr_set_fir(dev);
+async function rtlsdr_demod_write_reg(
+  device: RadioDevice,
+  page: number,
+  addr: number,
+  val: number,
+  len: number
+) {
+  const data = new Uint8Array(2);
+  const index = 0x10 | page;
+  addr = (addr << 8) | 0x20;
 
-//   /* enable SDR mode, disable DAGC (bit 5) */
-//   rtlsdr_demod_write_reg(dev, 0, 0x19, 0x05, 1);
+  if (len === 1) {
+    data[0] = val & 0xff;
+  } else {
+    data[0] = val >> 8;
+  }
 
-//   /* init FSM state-holding register */
-//   rtlsdr_demod_write_reg(dev, 1, 0x93, 0xf0, 1);
-//   rtlsdr_demod_write_reg(dev, 1, 0x94, 0x0f, 1);
+  data[1] = val & 0xff;
 
-//   /* disable AGC (en_dagc, bit 0) (this seems to have no effect) */
-//   rtlsdr_demod_write_reg(dev, 1, 0x11, 0x00, 1);
+  // #define CTRL_OUT	(LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_OUT)
+  //const r = libusb_control_transfer(dev->devh, CTRL_OUT, 0, addr, index, data, len, CTRL_TIMEOUT);
+  const r = await device.usb.controlTransferOut(
+    {
+      requestType: USBRequestType.VENDOR,
+      recipient: USBRecipient.DEVICE,
+      index,
+      request: addr,
+      value: val
+    },
+    data
+  );
 
-//   /* disable RF and IF AGC loop */
-//   rtlsdr_demod_write_reg(dev, 1, 0x04, 0x00, 1);
+  if (r.status !== "ok") {
+    console.log(r);
+    throw new Error(`Failed with response code ${r.status}`);
+  }
 
-//   /* disable PID filter (enable_PID = 0) */
-//   rtlsdr_demod_write_reg(dev, 0, 0x61, 0x60, 1);
+  await rtlsdr_demod_read_reg(device, 0x0a, 0x01, 1);
 
-//   /* opt_adc_iq = 0, default ADC_I/ADC_Q datapath */
-//   rtlsdr_demod_write_reg(dev, 0, 0x06, 0x80, 1);
+  return r.bytesWritten === length ? 0 : -1;
+}
 
-//   /* Enable Zero-IF mode (en_bbin bit), DC cancellation (en_dc_est),
-// 	 * IQ estimation/compensation (en_iq_comp, en_iq_est) */
-//   rtlsdr_demod_write_reg(dev, 1, 0xb1, 0x1b, 1);
+async function rtlsdr_set_fir(device: RadioDevice) {
+  const fir = new Uint8Array(20);
 
-//   /* disable 4.096 MHz clock output on pin TP_CK0 */
-//   rtlsdr_demod_write_reg(dev, 0, 0x0d, 0x83, 1);
-// }
+  /* format: int8_t[8] */
+  for (let i = 0; i < 8; ++i) {
+    let val = device.fir[i];
+    if (val < -128 || val > 127) {
+      return -1;
+    }
+    fir[i] = val;
+  }
+  /* format: int12_t[8] */
+  for (let i = 0; i < 8; i += 2) {
+    const val0 = device.fir[8 + i];
+    const val1 = device.fir[8 + i + 1];
+    if (val0 < -2048 || val0 > 2047 || val1 < -2048 || val1 > 2047) {
+      return -1;
+    }
+    fir[8 + i * 3 / 2] = val0 >> 4;
+    fir[8 + i * 3 / 2 + 1] = (val0 << 4) | ((val1 >> 8) & 0x0f);
+    fir[8 + i * 3 / 2 + 2] = val1;
+  }
+
+  for (let i = 0; i < device.fir.length; i++) {
+    if (await rtlsdr_demod_write_reg(device, 1, 0x1c + i, fir[i], 1)) {
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+async function rtlsdr_set_i2c_repeater(device: RadioDevice, on: boolean) {
+  rtlsdr_demod_write_reg(device, 1, 0x01, on ? 0x18 : 0x10, 1);
+}
+
+async function rtlsdr_init_baseband(dev: RadioDevice) {
+  /* initialize USB */
+  await rtlsdr_write_reg(dev, BLOCKS.USBB, USB_REG.USB_SYSCTL, 0x09, 1);
+  await rtlsdr_write_reg(dev, BLOCKS.USBB, USB_REG.USB_EPA_MAXPKT, 0x0002, 2);
+  await rtlsdr_write_reg(dev, BLOCKS.USBB, USB_REG.USB_EPA_CTL, 0x1002, 2);
+
+  /* poweron demod */
+  await rtlsdr_write_reg(dev, BLOCKS.SYSB, SYS_REG.DEMOD_CTL_1, 0x22, 1);
+  await rtlsdr_write_reg(dev, BLOCKS.SYSB, SYS_REG.DEMOD_CTL, 0xe8, 1);
+
+  await sleep(10);
+
+  /* reset demod (bit 3, soft_rst) */
+  await rtlsdr_demod_write_reg(dev, 1, 0x01, 0x14, 1);
+  await rtlsdr_demod_write_reg(dev, 1, 0x01, 0x10, 1);
+
+  /* disable spectrum inversion and adjacent channel rejection */
+  await rtlsdr_demod_write_reg(dev, 1, 0x15, 0x00, 1);
+  await rtlsdr_demod_write_reg(dev, 1, 0x16, 0x0000, 2);
+
+  /* clear both DDC shift and IF frequency registers  */
+  for (let i = 0; i < 6; i++) {
+    await rtlsdr_demod_write_reg(dev, 1, 0x16 + i, 0x00, 1);
+  }
+
+  await rtlsdr_set_fir(dev);
+
+  /* enable SDR mode, disable DAGC (bit 5) */
+  await rtlsdr_demod_write_reg(dev, 0, 0x19, 0x05, 1);
+
+  /* init FSM state-holding register */
+  await rtlsdr_demod_write_reg(dev, 1, 0x93, 0xf0, 1);
+  await rtlsdr_demod_write_reg(dev, 1, 0x94, 0x0f, 1);
+
+  /* disable AGC (en_dagc, bit 0) (this seems to have no effect) */
+  await rtlsdr_demod_write_reg(dev, 1, 0x11, 0x00, 1);
+
+  /* disable RF and IF AGC loop */
+  await rtlsdr_demod_write_reg(dev, 1, 0x04, 0x00, 1);
+
+  /* disable PID filter (enable_PID = 0) */
+  await rtlsdr_demod_write_reg(dev, 0, 0x61, 0x60, 1);
+
+  /* opt_adc_iq = 0, default ADC_I/ADC_Q datapath */
+  await rtlsdr_demod_write_reg(dev, 0, 0x06, 0x80, 1);
+
+  /* Enable Zero-IF mode (en_bbin bit), DC cancellation (en_dc_est),
+* IQ estimation/compensation (en_iq_comp, en_iq_est) */
+  await rtlsdr_demod_write_reg(dev, 1, 0xb1, 0x1b, 1);
+
+  /* disable 4.096 MHz clock output on pin TP_CK0 */
+  await rtlsdr_demod_write_reg(dev, 0, 0x0d, 0x83, 1);
+}
