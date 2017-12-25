@@ -1,4 +1,5 @@
 import { findProductNameFromVendorAndProductId } from "./device_lookup";
+import { RadioDevice } from "./radio_device";
 
 enum USB_REG {
   USB_SYSCTL = 0x2000,
@@ -38,40 +39,6 @@ enum SYS_REG {
   IR_SUSPEND = 0x300c
 }
 
-const FIR_LEN = 16;
-
-/*
- * FIR coefficients.
- *
- * The filter is running at XTal frequency. It is symmetric filter with 32
- * coefficients. Only first 16 coefficients are specified, the other 16
- * use the same values but in reversed order. The first coefficient in
- * the array is the outer one, the last, the last is the inner one.
- * First 8 coefficients are 8 bit signed integers, the next 8 coefficients
- * are 12 bit signed integers. All coefficients have the same weight.
- *
- * Default FIR coefficients used for DAB/FM by the Windows driver,
- * the DVB driver uses different ones
- */
-const fir_default = [
-  -54,
-  -36,
-  -41,
-  -40,
-  -32,
-  -14,
-  14,
-  53 /* 8 bit signed */,
-  101,
-  156,
-  215,
-  273,
-  327,
-  372,
-  404,
-  421 /* 12 bit signed */
-];
-
 enum USBRequestType {
   STANDARD = "standard",
   CLASS = "class",
@@ -89,14 +56,6 @@ function sleep(time: number) {
   return new Promise(res => {
     setTimeout(res, time);
   });
-}
-
-class RadioDevice {
-  fir: number[];
-
-  constructor(public usb: USBDevice) {
-    this.fir = Array.from(fir_default);
-  }
 }
 
 export async function run() {
@@ -120,19 +79,19 @@ async function handleDevice(device: USBDevice) {
   if (product != null) {
     console.info(`Found device ${product}`);
     await device.open();
-    const openInterface = await getOpenInterfaceNumber(device);
-
-    if (openInterface == null) {
-      throw new Error("Unable to find open interface.");
-    }
-
-    await device.claimInterface(openInterface);
-    console.info(`Interface ${openInterface} claimed`);
     const radio = new RadioDevice(device);
+    await radio.claimIntefaces();
 
     /* perform a dummy write, if it fails, reset the device */
     try {
-      await rtlsdr_write_reg(radio, BLOCKS.USBB, USB_REG.USB_SYSCTL, 0x09, 1);
+      const r = await rtlsdr_write_reg(
+        radio,
+        BLOCKS.USBB,
+        USB_REG.USB_SYSCTL,
+        0x09,
+        1
+      );
+      console.log(r);
     } catch (e) {
       throw new Error("Device in invalid state.. please reconnect.");
     }
@@ -141,24 +100,12 @@ async function handleDevice(device: USBDevice) {
     await rtlsdr_init_baseband(radio);
 
     // Turn radio on
-    // await rtlsdr_set_i2c_repeater(radio, true);
+    await rtlsdr_set_i2c_repeater(radio, true);
     // Turn radio off
-    // await rtlsdr_set_i2c_repeater(radio, false);
+    await rtlsdr_set_i2c_repeater(radio, false);
   } else {
     throw new Error("Unknown device found.");
   }
-}
-
-async function getOpenInterfaceNumber(device: USBDevice) {
-  for (const config of device.configurations) {
-    for (const iface of config.interfaces) {
-      if (!iface.claimed) {
-        return iface.interfaceNumber;
-      }
-    }
-  }
-
-  return null;
 }
 
 async function rtlsdr_write_reg(
@@ -187,8 +134,8 @@ async function rtlsdr_write_reg(
       requestType: USBRequestType.VENDOR,
       recipient: USBRecipient.DEVICE,
       index,
-      request: addr,
-      value: val
+      request: 0,
+      value: addr
     },
     data
   );
@@ -214,13 +161,29 @@ async function rtlsdr_demod_read_reg(
 
   // CTRL_IN         (LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_IN)
   //r = libusb_control_transfer(dev->devh, CTRL_IN, 0, addr, index, data, len, CTRL_TIMEOUT);
+
+  /*
+    libusb_device_handle * 	dev_handle,
+    uint8_t 	bmRequestType,
+    uint8_t 	bRequest,
+    uint16_t 	wValue,
+    uint16_t 	wIndex,
+    unsigned char * 	data,
+    uint16_t 	wLength,
+    unsigned int 	timeout 
+  */
+
+  //   value === uint16_t 	wValue,
+  //   index === uint16_t 	wIndex,
+  //   request === bRequest
+
   const r = await device.usb.controlTransferIn(
     {
       requestType: USBRequestType.VENDOR,
       recipient: USBRecipient.DEVICE,
       index,
-      request: addr,
-      value: val
+      request: 0,
+      value: addr
     },
     data.length
   );
@@ -261,14 +224,13 @@ async function rtlsdr_demod_write_reg(
       requestType: USBRequestType.VENDOR,
       recipient: USBRecipient.DEVICE,
       index,
-      request: addr,
-      value: val
+      request: 0,
+      value: addr
     },
     data
   );
 
   if (r.status !== "ok") {
-    console.log(r);
     throw new Error(`Failed with response code ${r.status}`);
   }
 
@@ -310,7 +272,7 @@ async function rtlsdr_set_fir(device: RadioDevice) {
 }
 
 async function rtlsdr_set_i2c_repeater(device: RadioDevice, on: boolean) {
-  rtlsdr_demod_write_reg(device, 1, 0x01, on ? 0x18 : 0x10, 1);
+  return rtlsdr_demod_write_reg(device, 1, 0x01, on ? 0x18 : 0x10, 1);
 }
 
 async function rtlsdr_init_baseband(dev: RadioDevice) {
